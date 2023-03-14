@@ -1,0 +1,208 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Cloud Formation deploy configuration for Label Service.
+
+Parameters:
+  ClusterName:
+    Type: String
+  ServiceName:
+    Type: String
+  EcrName:
+    Type: String
+  CommitId:
+    Type: String
+  ContainerPort:
+    Type: Number
+    Default: 80
+  DesiredCount:
+    Type: Number
+    Default: 1
+  SecurityGroups:
+    Type: List<String>
+  Subnets:
+    Type: List<AWS::EC2::Subnet::Id>
+  TargetGroupArn:
+    Type: String
+  NamespaceId:
+    Type: String
+  CpuTask:
+    Type: Number
+    Default: 256
+  MemoryTask:
+    Type: Number
+    Default: 512
+  CpuQueueTask:
+    Type: Number
+    Default: 256
+  MemoryQueueTask:
+    Type: Number
+    Default: 512
+
+Resources:
+  CloudWatchLogsGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Ref AWS::StackName
+      RetentionInDays: 365
+
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+                - lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ecs-service
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecs:CreateCluster
+                  - ecs:DeregisterContainerInstance
+                  - ecs:DiscoverPollEndpoint
+                  - ecs:Poll
+                  - ecs:RegisterContainerInstance
+                  - ecs:StartTelemetrySession
+                  - ecs:Submit*
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - ecr:*
+                  - es:*
+                  - lamda:*
+                  - cloudwatch:*
+                  - s3:*
+                Resource: "*"
+      RoleName: !Sub ${ServiceName}-ECSTaskExecutionRole-${AWS::Region}
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      ContainerDefinitions:
+        - Name: !Ref ServiceName
+          Essential: true
+          Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EcrName}:${CommitId}
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-region: !Ref AWS::Region
+              awslogs-group: !Ref CloudWatchLogsGroup
+              awslogs-stream-prefix: !Ref ServiceName
+          PortMappings:
+            - ContainerPort: !Ref ContainerPort
+      Cpu: !Ref CpuTask
+      ExecutionRoleArn: !Ref ECSTaskExecutionRole
+      Family: !Ref ServiceName
+      Memory: !Ref MemoryTask
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      TaskRoleArn: !Ref ECSTaskExecutionRole
+
+  Service:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub ${ServiceName}
+      Cluster: !Ref ClusterName
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      LoadBalancers:
+        - ContainerName: !Ref ServiceName
+          ContainerPort: !Ref ContainerPort
+          TargetGroupArn: !Ref TargetGroupArn
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups: !Ref SecurityGroups
+          Subnets: !Split [',', !Join [',', !Ref Subnets]]
+      ServiceRegistries:
+        - RegistryArn: !GetAtt DiscoveryService.Arn
+          Port: 80
+      TaskDefinition: !Ref TaskDefinition
+
+  DiscoveryService:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      DnsConfig:
+        DnsRecords:
+          - TTL: 60
+            Type: A
+          - TTL: 60
+            Type: SRV
+        RoutingPolicy: MULTIVALUE
+      HealthCheckCustomConfig:
+        FailureThreshold: 1
+      Name: !Ref ServiceName
+      NamespaceId: !Ref NamespaceId
+
+  QueueTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      ContainerDefinitions:
+        - Name: !Sub ${ServiceName}-queue
+          Command:
+            - sh
+            - /sbin/boot-queue.sh
+          Essential: true
+          Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EcrName}:${CommitId}
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-region: !Ref AWS::Region
+              awslogs-group: !Ref CloudWatchLogsGroup
+              awslogs-stream-prefix: !Ref ServiceName
+      Cpu: !Ref CpuQueueTask
+      ExecutionRoleArn: !Ref ECSTaskExecutionRole
+      Family: !Sub ${ServiceName}-queue
+      Memory: !Ref MemoryQueueTask
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      TaskRoleArn: !Ref ECSTaskExecutionRole
+
+  QueueService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub ${ServiceName}-queue
+      Cluster: !Ref ClusterName
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups: !Ref SecurityGroups
+          Subnets: !Split [',', !Join [',', !Ref Subnets]]
+      TaskDefinition: !Ref QueueTaskDefinition
+  ResetUserSpotlight:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: "cron(* * * * ? *)"
+      State: ENABLED
+      Targets:
+        - Arn: !Sub arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:cluster/${ClusterName}
+          Id: !Sub ${ServiceName}-scheduled-tasks
+          RoleArn: !Sub arn:aws:iam::${AWS::AccountId}:role/ecsEventsRole
+          EcsParameters:
+            TaskCount: 1
+            TaskDefinitionArn: !Ref TaskDefinition
+            LaunchType: "FARGATE"
+            NetworkConfiguration:
+              AwsVpcConfiguration:
+                AssignPublicIp: ENABLED
+                SecurityGroups: !Ref SecurityGroups
+                Subnets: !Split [ ',', !Join [ ',', !Ref Subnets ] ]
+          Input: !Sub |
+            {
+                "containerOverrides": [
+                    {
+                        "name": "${ServiceName}",
+                        "command": ["/usr/bin/php", "/var/www/html/artisan", "user:reset-spotlight"]
+                    }
+                ]
+            }

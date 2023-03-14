@@ -1,0 +1,98 @@
+image: alpine:3.16 # latest in 20221006
+
+definitions:
+  steps:
+    build: &build
+      name: Build
+      service: docker
+      caches:
+        - docker
+        - composer
+      script:
+        - export IMAGE_NAME=$ECR_NAME:$BITBUCKET_COMMIT
+        - apk add gettext
+        - apk add --no-cache bash git openssh
+        - git submodule update --init --recursive
+        - envsubst < .env.deployment > .env.example
+        - docker build -f deployment/docker/Dockerfile -t $IMAGE_NAME .
+        - pipe: atlassian/aws-ecr-push-image:1.6.2
+          variables:
+            IMAGE_NAME: $IMAGE_NAME
+            TAGS: ${BITBUCKET_COMMIT}
+
+    deploy: &deploy
+      name: Deploy
+      script:
+        - pipe: atlassian/aws-cloudformation-deploy:0.13.0
+          variables:
+            STACK_NAME: $STACK_NAME
+            TEMPLATE: deployment/aws/cloud-formation.yml
+            STACK_PARAMETERS: >
+              [
+                { ParameterKey: ClusterName, ParameterValue: $CLUSTER_NAME },
+                { ParameterKey: ServiceName, ParameterValue: $SERVICE_NAME },
+                { ParameterKey: EcrName, ParameterValue: $ECR_NAME },
+                { ParameterKey: CommitId, ParameterValue: $BITBUCKET_COMMIT },
+                { ParameterKey: SecurityGroups, ParameterValue: $SECURITY_GROUPS },
+                { ParameterKey: DesiredCount, ParameterValue: "$DESIRED_COUNT" },
+                { ParameterKey: Subnets, ParameterValue: "$SUBNETS" },
+                { ParameterKey: TargetGroupArn, ParameterValue: $TARGET_GROUP_ARN },
+                { ParameterKey: CpuTask, ParameterValue: "$CPU_TASK" },
+                { ParameterKey: MemoryTask, ParameterValue: "$MEMORY_TASK" },
+                { ParameterKey: CpuQueueTask, ParameterValue: "$CPU_TASK" },
+                { ParameterKey: MemoryQueueTask, ParameterValue: "$MEMORY_TASK" },
+                { ParameterKey: NamespaceId, ParameterValue: $NAMESPACE_ID }
+              ]
+            CAPABILITIES: ["CAPABILITY_IAM", "CAPABILITY_NAMED_IAM"]
+            WAIT: "true"
+
+    run-after-deploy: &run-after-deploy
+      name: Migrate
+      image: amazon/aws-cli:2.8.1
+      script:
+        - >
+          aws ecs run-task
+          --launch-type FARGATE
+          --cluster $CLUSTER_NAME
+          --task-definition $SERVICE_NAME
+          --group Migration
+          --overrides '{
+            "containerOverrides": [
+              {
+                "name": "'"$SERVICE_NAME"'",
+                "command": ["/usr/bin/php", "/var/www/html/artisan", "run:after-deploy"]
+              }
+            ]
+          }'
+          --count 1
+          --network-configuration '{
+            "awsvpcConfiguration": {
+              "assignPublicIp": "ENABLED",
+              "securityGroups": ["'"$SECURITY_GROUPS"'"],
+              "subnets": ["'"$SUBNET1"'", "'"$SUBNET2"'"]
+            }
+          }'
+
+pipelines:
+  branches:
+    develop:
+      - step:
+          <<: *build
+          deployment: DevelopBuild
+      - step:
+          <<: *deploy
+          deployment: DevelopDeploy
+      - step:
+          <<: *run-after-deploy
+          deployment: DevelopMigrate
+    master:
+      - step:
+          <<: *build
+          deployment: ProductionBuild
+      - step:
+          <<: *deploy
+          deployment: ProductionDeploy
+      - step:
+          <<: *run-after-deploy
+          deployment: ProductionMigrate
+
